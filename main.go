@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/cap/oidc/callback"
 	"github.com/hashicorp/cap/util"
 	"github.com/hashicorp/go-hclog"
+	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
 )
 
@@ -72,12 +73,17 @@ func envConfig(secretNotRequired bool) (map[string]interface{}, error) {
 }
 
 func main() {
+	_ = godotenv.Load()
 	useImplicit := flag.Bool("implicit", false, "use the implicit flow")
 	implicitAccessToken := flag.Bool("implicit-access-token", false, "include the access_token in the implicit flow")
 	usePKCE := flag.Bool("pkce", false, "use the implicit flow")
 	maxAge := flag.Int("max-age", -1, "max age of user authentication")
 	scopes := flag.String("scopes", "", "comma separated list of additional scopes to requests")
 	useTestProvider := flag.Bool("use-test-provider", false, "use the test oidc provider")
+	jsonOutput := flag.Bool("json", false, "output token and user info as JSON")
+	noBrowser := flag.Bool("no-browser", false, "do not automatically open the browser for authentication")
+	authURLFile := flag.String("auth-url-file", "", "if set, write the authorization URL to this JSON file")
+	accessTokenFile := flag.String("access-token-file", "", "if set, write the AccessToken to this file")
 
 	flag.Parse()
 	if *useImplicit && *usePKCE {
@@ -261,6 +267,21 @@ func main() {
 		return
 	}
 
+	if *authURLFile != "" {
+		urlObj := map[string]string{"auth_url": authURL}
+		data, err := json.MarshalIndent(urlObj, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error marshaling auth URL to JSON: %s\n", err)
+			return
+		}
+		if err := os.WriteFile(*authURLFile, data, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing auth URL to file: %s\n", err)
+			return
+		}
+		// Ensure the file is deleted when the app exits
+		defer os.Remove(*authURLFile)
+	}
+
 	// Set up callback handler
 	http.HandleFunc("/callback", handler)
 
@@ -272,9 +293,11 @@ func main() {
 	defer listener.Close()
 
 	// Open the default browser to the callback URL.
-	fmt.Fprintf(os.Stderr, "Complete the login via your OIDC provider. Launching browser to:\n\n    %s\n\n\n", authURL)
-	if err := util.OpenURL(authURL); err != nil {
-		fmt.Fprintf(os.Stderr, "Error attempting to automatically open browser: '%s'.\nPlease visit the authorization URL manually.", err)
+	fmt.Fprintf(os.Stderr, "Complete the login via your OIDC provider. Visit this URL:\n\n    %s\n\n\n", authURL)
+	if !*noBrowser {
+		if err := util.OpenURL(authURL); err != nil {
+			fmt.Fprintf(os.Stderr, "Error attempting to automatically open browser: '%s'.\nPlease visit the authorization URL manually.", err)
+		}
 	}
 
 	srvCh := make(chan error)
@@ -294,6 +317,26 @@ func main() {
 	case resp := <-successCh:
 		if resp.Error != nil {
 			fmt.Fprintf(os.Stderr, "channel received success with error: %s", resp.Error)
+			return
+		}
+		if *jsonOutput {
+			// Output everything as JSON to stdout
+			result := make(map[string]interface{})
+			result["token"] = printableToken(resp.Token)
+			tokenObj := map[string]string{"access_token": string(resp.Token.AccessToken())}
+			data, err := json.MarshalIndent(tokenObj, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error marshaling AccessToken to JSON: %s\n", err)
+			} else if err := os.WriteFile(*accessTokenFile, data, 0600); err != nil {
+				fmt.Fprintf(os.Stderr, "error writing AccessToken to file: %s\n", err)
+			}
+			result["id_token_claims"] = getClaimsMap(resp.Token.IDToken())
+			if userInfo := getUserInfoMap(ctx, p, resp.Token); userInfo != nil {
+				result["user_info"] = userInfo
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "    ")
+			enc.Encode(result)
 			return
 		}
 		printToken(resp.Token)
@@ -439,4 +482,37 @@ func printableToken(t oidc.Token) respToken {
 		RefreshToken: string(t.RefreshToken()),
 		Expiry:       t.Expiry(),
 	}
+}
+
+// Helper to extract claims from IDToken as map[string]interface{}
+func getClaimsMap(t oidc.IDToken) map[string]interface{} {
+	var tokenClaims map[string]interface{}
+	if err := t.Claims(&tokenClaims); err != nil {
+		return nil
+	}
+	return tokenClaims
+}
+
+// Helper to extract user info as map[string]interface{}
+func getUserInfoMap(ctx context.Context, p *oidc.Provider, t oidc.Token) map[string]interface{} {
+	if ts, ok := t.(interface {
+		StaticTokenSource() oauth2.TokenSource
+	}); ok {
+		if ts.StaticTokenSource() == nil {
+			return nil
+		}
+		vc := struct {
+			Sub string
+		}{}
+		if err := t.IDToken().Claims(&vc); err != nil {
+			return nil
+		}
+		var infoClaims map[string]interface{}
+		err := p.UserInfo(ctx, ts.StaticTokenSource(), vc.Sub, &infoClaims)
+		if err != nil {
+			return nil
+		}
+		return infoClaims
+	}
+	return nil
 }
